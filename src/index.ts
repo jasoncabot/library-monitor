@@ -11,7 +11,11 @@ interface Book {
   status: string;
 }
 
-const checkForOverdueBooks = async (borrowerId: string, password: string) => {
+const checkForOverdueBooks = async (
+  alwaysSend: boolean,
+  borrowerId: string,
+  password: string
+) => {
   const rdt = encodeURIComponent(
     "/cgi-bin/spydus.exe/PGM/WPAC/CCOPT/LB/1?ISGLB=0"
   );
@@ -68,7 +72,7 @@ const checkForOverdueBooks = async (borrowerId: string, password: string) => {
           books.push({ id: e.getAttribute("value") });
         },
       })
-      .on(`h5.card-title`, {
+      .on(`h2.card-title`, {
         text(text: Text) {
           if (!text.lastInTextNode) {
             books[books.length - 1].title = text.text;
@@ -90,6 +94,7 @@ const checkForOverdueBooks = async (borrowerId: string, password: string) => {
         },
       })
       .transform(spydusResponse);
+
     await rewriter.text();
     console.log(`Found ${books.length} book(s), checking for overdue...`);
 
@@ -98,10 +103,10 @@ const checkForOverdueBooks = async (borrowerId: string, password: string) => {
     const overdue = books.filter((book) => {
       const dueAt = Date.parse(book.due);
       let difference = dueAt - now.getTime();
-      return difference < 172800000;
+      return alwaysSend || difference < 172800000;
     }) as Book[];
 
-    console.log(`Found ${overdue.length} overdue books out of ${books.length}`);
+    console.log(`Found ${overdue.length} books out of ${books.length}`);
 
     // 2. If any are overdue
     if (overdue.length > 0) {
@@ -130,7 +135,7 @@ const checkForOverdueBooks = async (borrowerId: string, password: string) => {
             email: "library-monitor@jasoncabot.com",
             name: "Library Monitor",
           },
-          subject: "Books near renewal date",
+          subject: `${books.length} books near renewal date`,
           content: [
             {
               type: "text/plain",
@@ -142,19 +147,24 @@ const checkForOverdueBooks = async (borrowerId: string, password: string) => {
 
       let resp = await fetch(sendEmail);
       let respText = await resp.text();
+      console.log(text);
       console.log("sent email and got " + respText);
     }
-
-    console.log("Done!");
-  } catch (error) {
-    console.warn("Error " + error);
+    return "done";
+  } catch (error: any) {
+    return error.message;
   }
 };
 
 export default {
   async fetch(request: Request, env: Env) {
-    await checkForOverdueBooks(env.BORROWER_ID, env.BORROWER_PASSWORD);
-    return new Response("Checked", { status: 200 });
+    const alwaysSend = request.url.includes("alwaysSend=true");
+    const response = await checkForOverdueBooks(
+      alwaysSend,
+      env.BORROWER_ID,
+      env.BORROWER_PASSWORD
+    );
+    return new Response(response, { status: 200 });
   },
 
   async scheduled(
@@ -162,6 +172,6 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<void> {
-    await checkForOverdueBooks(env.BORROWER_ID, env.BORROWER_PASSWORD);
+    await checkForOverdueBooks(false, env.BORROWER_ID, env.BORROWER_PASSWORD);
   },
 };
