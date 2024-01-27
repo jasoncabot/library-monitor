@@ -135,7 +135,7 @@ const checkForOverdueBooks = async (
             email: "no-reply@jasoncabot.me",
             name: "Library Monitor",
           },
-          subject: `${books.length} books near renewal date`,
+          subject: `${overdue.length} ${overdue.length === 1 ? "book" : "books"} near renewal date`,
           content: [
             {
               type: "text/plain",
