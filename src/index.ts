@@ -1,11 +1,16 @@
+import { SendEmail } from "@cloudflare/workers-types";
+import { EmailMessage } from "cloudflare:email";
+import { createMimeMessage } from "mimetext";
 import { parseString } from "set-cookie-parser";
 
 export interface Env {
   BORROWER_ID: string;
   BORROWER_PASSWORD: string;
+  EMAIL: SendEmail;
 }
 
 interface Book {
+  id: string | null;
   title: string;
   due: string;
   status: string;
@@ -14,7 +19,8 @@ interface Book {
 const checkForOverdueBooks = async (
   alwaysSend: boolean,
   borrowerId: string,
-  password: string
+  password: string,
+  mailer: SendEmail
 ) => {
   const rdt = encodeURIComponent(
     "/cgi-bin/spydus.exe/PGM/WPAC/CCOPT/LB/1?ISGLB=0"
@@ -46,109 +52,43 @@ const checkForOverdueBooks = async (
 
     // Check home page for link to the main dashboard
     console.log(`Loading dashboard from ${dashLink}`);
-    let dashResponse = await (
-      await fetch(dashLink, {
-        headers: { cookie: `SPYDUS_BRWSESSIONID_443=${value}` },
-      })
-    ).text();
-
-    const loansPath = (new RegExp(
-      /"(\/cgi-bin\/spydus.exe\/ENQ\/WPAC\/LOANRENQ[^"]+QRY=OND01[^"]+)"/
-    ).exec(dashResponse) || ["", ""])[1]
-      .replaceAll("&amp;", "&")
-      .replaceAll("&lt;", "%3C")
-      .replaceAll("&gt;", "%3E");
-    const loansURL = "https://wokingham.spydus.co.uk" + loansPath;
-
-    console.log("Finding all loans from " + loansURL);
-    const spydusResponse = await fetch(loansURL, {
+    let dashResponse = await fetch(dashLink, {
       headers: { cookie: `SPYDUS_BRWSESSIONID_443=${value}` },
     });
 
-    const books: any[] = [];
-    const rewriter = new HTMLRewriter()
-      .on(`input[name=SVL]`, {
-        element(e: Element) {
-          books.push({ id: e.getAttribute("value") });
-        },
-      })
-      .on(`h2.card-title`, {
-        text(text: Text) {
-          if (!text.lastInTextNode) {
-            books[books.length - 1].title = text.text;
-          }
-        },
-      })
-      .on("td[data-caption='Due']", {
-        text(text: Text) {
-          if (!text.lastInTextNode) {
-            books[books.length - 1].due = text.text;
-          }
-        },
-      })
-      .on("td[data-caption='Status']", {
-        text(text: Text) {
-          if (!text.lastInTextNode) {
-            books[books.length - 1].status = text.text;
-          }
-        },
-      })
-      .transform(spydusResponse);
+    const urls = await extractLoanUrls(dashResponse);
+    console.log(`Found ${urls.length} loan url(s) on dashboard`);
 
-    await rewriter.text();
-    console.log(`Found ${books.length} book(s), checking for overdue...`);
+    const books: Book[] = (
+      await Promise.all(
+        urls.map(async (url) => await findBooksOnLoan(url, value))
+      )
+    ).flat();
 
     // find any books past or nearing renewal date
     const now = new Date();
-    const overdue = books.filter((book) => {
+    const notify = books.filter((book) => {
       const dueAt = Date.parse(book.due);
+      console.log(`${book.title} is due ${book.due} with status ${book.status}...`);
       let difference = dueAt - now.getTime();
       return alwaysSend || difference < 172800000;
     }) as Book[];
 
-    console.log(`Found ${overdue.length} books out of ${books.length}`);
+    console.log(`Found ${notify.length} overdue books out of ${books.length}`);
 
     // 2. If any are overdue
-    if (overdue.length > 0) {
-      const text = overdue
+    if (notify.length > 0) {
+      const text = notify
         .map(
           (book) =>
             `* ${book.title} is due ${book.due} and has status: ${book.status}.`
         )
         .join("\n");
 
-      const sendEmail = new Request("https://api.mailchannels.net/tx/v1/send", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          personalizations: [
-            {
-              to: [
-                { email: "jasoncabot@gmail.com" },
-                { email: "kirstycabot@gmail.com" },
-              ],
-            },
-          ],
-          from: {
-            email: "no-reply@jasoncabot.me",
-            name: "Library Monitor",
-          },
-          subject: `${overdue.length} ${overdue.length === 1 ? "book" : "books"} near renewal date`,
-          content: [
-            {
-              type: "text/plain",
-              value: text,
-            },
-          ],
-        }),
-      });
+      // send email
+      await sendEmail(mailer, notify, text);
 
-      let resp = await fetch(sendEmail);
-      let respText = await resp.text();
-      console.log(text);
-      console.log("sent email and got " + respText);
+      console.log("sent email");
     }
     return "done";
   } catch (error: any) {
@@ -162,7 +102,8 @@ export default {
     const response = await checkForOverdueBooks(
       alwaysSend,
       env.BORROWER_ID,
-      env.BORROWER_PASSWORD
+      env.BORROWER_PASSWORD,
+      env.EMAIL
     );
     return new Response(response, { status: 200 });
   },
@@ -172,6 +113,119 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<void> {
-    await checkForOverdueBooks(false, env.BORROWER_ID, env.BORROWER_PASSWORD);
+    await checkForOverdueBooks(
+      false,
+      env.BORROWER_ID,
+      env.BORROWER_PASSWORD,
+      env.EMAIL
+    );
   },
 };
+
+async function sendEmail(mailer: SendEmail, overdue: Book[], content: string) {
+  const msg = createMimeMessage();
+  const sendingAddress = "no-reply@jasoncabot.me";
+  const receipients = [
+    { name: "Jason Cabot", addr: "jasoncabot@gmail.com" },
+    { name: "Kirsty Cabot", addr: "kirstycabot@gmail.com" },
+  ];
+  msg.setSender({ name: "Library Monitor", addr: sendingAddress });
+  msg.setRecipients(receipients);
+  msg.setSubject(
+    `${overdue.length} ${
+      overdue.length === 1 ? "book" : "books"
+    } near renewal date`
+  );
+  msg.addMessage({
+    contentType: "text/plain",
+    data: content,
+  });
+
+  const message = new EmailMessage(
+    sendingAddress,
+    receipients.map((r) => r.addr).join(","),
+    msg.asRaw()
+  );
+  try {
+    await mailer.send(message);
+  } catch (e: any) {
+    return new Response(e.message);
+  }
+}
+
+async function extractLoanUrls(dashResponse: Response): Promise<string[]> {
+  // find the href value of all anchor tags with class brw-dashboard-item
+  const urls: string[] = [];
+  const rewriter = new HTMLRewriter()
+    .on(`a.brw-dashboard-item`, {
+      element(e: Element) {
+        const href = e.getAttribute("href");
+        if (href) {
+          urls.push(href);
+        }
+      },
+    })
+    .transform(dashResponse);
+  await rewriter.text();
+
+  return urls;
+}
+
+async function findBooksOnLoan(url: string, value: any): Promise<Book[]> {
+  const loansPath = url
+    .replaceAll("&amp;", "&")
+    .replaceAll("&lt;", "%3C")
+    .replaceAll("&gt;", "%3E");
+  const loansURL = "https://wokingham.spydus.co.uk" + loansPath;
+
+  console.log("Finding all loans from " + loansURL);
+  const spydusResponse = await fetch(loansURL, {
+    headers: { cookie: `SPYDUS_BRWSESSIONID_443=${value}` },
+  });
+
+  const books: Book[] = [];
+  const rewriter = new HTMLRewriter()
+    .on(`input[name=SVL]`, {
+      element(e: Element) {
+        books.push({ id: e.getAttribute("value"), title: "", due: "", status: "" });
+      },
+    })
+    .on(`h2.card-title`, {
+      text(text: Text) {
+        if (!text.lastInTextNode) {
+          books[books.length - 1].title = text.text;
+        }
+      },
+    })
+    .on("td[data-caption='Due']", {
+      text(text: Text) {
+        if (!text.lastInTextNode) {
+          if (!books[books.length - 1].due) {
+            books[books.length - 1].due = text.text;
+          } else {
+            books[books.length - 1].due = `${books[books.length - 1].due}${
+              text.text
+            }`;
+          }
+        }
+      },
+    })
+    .on("td[data-caption='Status']", {
+      text(text: Text) {
+        if (!text.lastInTextNode) {
+          if (!books[books.length - 1].status) {
+            books[books.length - 1].status = text.text;
+          } else {
+            books[books.length - 1].status = `${
+              books[books.length - 1].status
+            }${text.text}`;
+          }
+        }
+      },
+    })
+    .transform(spydusResponse);
+
+  await rewriter.text();
+
+  return books;
+}
