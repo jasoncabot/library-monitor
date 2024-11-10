@@ -69,7 +69,9 @@ const checkForOverdueBooks = async (
     const now = new Date();
     const notify = books.filter((book) => {
       const dueAt = Date.parse(book.due);
-      console.log(`${book.title} is due ${book.due} with status ${book.status}...`);
+      console.log(
+        `${book.title} is due ${book.due} with status ${book.status}...`
+      );
       let difference = dueAt - now.getTime();
       return alwaysSend || difference < 172800000;
     }) as Book[];
@@ -86,9 +88,14 @@ const checkForOverdueBooks = async (
         .join("\n");
 
       // send email
-      await sendEmail(mailer, notify, text);
+      try {
+        await sendEmail(mailer, notify, text);
+        console.log("sent email");
+      } catch (error: any) {
+        console.error("Error sending email: " + error.message);
+        return error
+      }
 
-      console.log("sent email");
     }
     return "done";
   } catch (error: any) {
@@ -123,35 +130,28 @@ export default {
 };
 
 async function sendEmail(mailer: SendEmail, overdue: Book[], content: string) {
-  const msg = createMimeMessage();
-  const sendingAddress = "no-reply@jasoncabot.me";
-  const receipients = [
+  const messages = [
     { name: "Jason Cabot", addr: "jasoncabot@gmail.com" },
     { name: "Kirsty Cabot", addr: "kirstycabot@gmail.com" },
-  ];
-  msg.setSender({ name: "Library Monitor", addr: sendingAddress });
-  msg.setRecipients(receipients);
-  msg.setSubject(
-    `${overdue.length} ${
-      overdue.length === 1 ? "book" : "books"
-    } near renewal date`
-  );
-  msg.addMessage({
-    contentType: "text/plain",
-    data: content,
+  ].map((r) => {
+    const msg = createMimeMessage();
+    const sendingAddress = "no-reply@jasoncabot.me";
+    msg.setSender({ name: "Library Monitor", addr: sendingAddress });
+    msg.setRecipient({ name: r.name, addr: r.addr });
+    msg.setSubject(
+      `${overdue.length} ${
+        overdue.length === 1 ? "book" : "books"
+      } near renewal date`
+    );
+    msg.addMessage({
+      contentType: "text/plain",
+      data: content,
+    });
+
+    return mailer.send(new EmailMessage(sendingAddress, r.addr, msg.asRaw()));
   });
 
-  const message = new EmailMessage(
-    sendingAddress,
-    receipients.map((r) => r.addr).join(","),
-    msg.asRaw()
-  );
-  try {
-    await mailer.send(message);
-  } catch (e: any) {
-    console.error(e.message);
-    return new Response(e.message);
-  }
+  return Promise.all(messages);
 }
 
 async function extractLoanUrls(dashResponse: Response): Promise<string[]> {
@@ -188,7 +188,12 @@ async function findBooksOnLoan(url: string, value: any): Promise<Book[]> {
   const rewriter = new HTMLRewriter()
     .on(`input[name=SVL]`, {
       element(e: Element) {
-        books.push({ id: e.getAttribute("value"), title: "", due: "", status: "" });
+        books.push({
+          id: e.getAttribute("value"),
+          title: "",
+          due: "",
+          status: "",
+        });
       },
     })
     .on(`h2.card-title`, {
