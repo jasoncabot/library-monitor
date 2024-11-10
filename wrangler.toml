@@ -5,7 +5,7 @@ node_compat = true
 workers_dev = false
 
 send_email = [
-    {name = "EMAIL" },
+    {name = "EMAIL", allowed_destination_addresses = ["jasoncabot@gmail.com", "kirstycabot@gmail.com"]},
 ]
 
 [triggers]
