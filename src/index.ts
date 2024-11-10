@@ -149,6 +149,7 @@ async function sendEmail(mailer: SendEmail, overdue: Book[], content: string) {
   try {
     await mailer.send(message);
   } catch (e: any) {
+    console.error(e.message);
     return new Response(e.message);
   }
 }
