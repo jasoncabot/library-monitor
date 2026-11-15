@@ -90,7 +90,17 @@ class Session {
         await response.body?.cancel();
         throw new SpydusError(`${url} returned ${response.status}`);
       }
-      return response.text();
+      const html = await response.text();
+
+      // After login Spydus answers with a tiny page whose script redirects to
+      // the account dashboard, so follow those like an HTTP redirect.
+      const scripted = html.length < 2000 && html.match(/location(?:\.href)?\s*=\s*["']([^"']+)["']|location\.replace\(\s*["']([^"']+)["']/i);
+      if (scripted) {
+        url = new URL(decode(scripted[1] ?? scripted[2]), url).toString();
+        init = {};
+        continue;
+      }
+      return html;
     }
     throw new SpydusError(`Too many redirects fetching ${url}`);
   }
@@ -177,14 +187,14 @@ async function fetchLoans() {
     throw new SpydusError("Login rejected: Invalid ID or password. Check BORROWER_ID and BORROWER_PASSWORD (a 4 digit PIN).");
   }
 
-  const dashboard = await session.get(BASE_URL + DASHBOARD_PATH);
+  // A successful login lands on the account dashboard.
+  const dashboard = loginHtml;
   const urls = loanUrls(dashboard);
   log("Found loan pages", { count: urls.length });
   if (urls.length === 0) {
     // Every account dashboard links to its loans, so none means the page has
-    // changed. Describe both pages so the parser can be fixed from the logs.
-    log("Login response", { cookies: [...session.cookies.keys()], ...describe(loginHtml) });
-    log("Dashboard", describe(dashboard));
+    // changed. Describe it so the parser can be fixed from the logs.
+    log("Dashboard", { cookies: [...session.cookies.keys()], ...describe(dashboard) });
     throw new SpydusError(
       /id\s*=\s*["']frmLogin["']/.test(dashboard)
         ? "Dashboard showed the login form, so the login was not kept"
