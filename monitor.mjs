@@ -139,6 +139,26 @@ const books = (html) => {
   });
 };
 
+// A structural summary of a page for diagnosing parser failures. Query strings
+// are dropped so session and account identifiers don't end up in logs.
+const describe = (html) => {
+  const path = (href) => decode(href).split(/[?#]/)[0];
+  const links = new Map();
+  for (const [tag] of html.matchAll(/<a\b[^>]*>/gi)) {
+    const href = attribute(tag, "href");
+    if (!href || !/spydus\.exe/i.test(href)) continue;
+    const key = path(href);
+    if (!links.has(key)) links.set(key, attribute(tag, "class") ?? "");
+  }
+  return {
+    bytes: html.length,
+    title: decode(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? ""),
+    headings: [...html.matchAll(/<h[1-3]\b[^>]*>([\s\S]*?)<\/h[1-3]>/gi)].map((m) => decode(m[1])).slice(0, 10),
+    redirects: [...html.matchAll(/(?:location(?:\.href)?\s*=|location\.replace\(|http-equiv=["']refresh["'][^>]*url=)\s*["']?([^"')\s>]+)/gi)].map((m) => path(m[1])),
+    links: [...links].slice(0, 40).map(([href, cls]) => (cls ? `${href} .${cls.trim().split(/\s+/).join(".")}` : href)),
+  };
+};
+
 // --- Checking -------------------------------------------------------------
 
 async function fetchLoans() {
@@ -159,10 +179,18 @@ async function fetchLoans() {
 
   const dashboard = await session.get(BASE_URL + DASHBOARD_PATH);
   const urls = loanUrls(dashboard);
-  if (urls.length === 0 && /id\s*=\s*["']frmLogin["']/.test(dashboard)) {
-    throw new SpydusError("Dashboard showed the login form, so the login was not kept");
-  }
   log("Found loan pages", { count: urls.length });
+  if (urls.length === 0) {
+    // Every account dashboard links to its loans, so none means the page has
+    // changed. Describe both pages so the parser can be fixed from the logs.
+    log("Login response", { cookies: [...session.cookies.keys()], ...describe(loginHtml) });
+    log("Dashboard", describe(dashboard));
+    throw new SpydusError(
+      /id\s*=\s*["']frmLogin["']/.test(dashboard)
+        ? "Dashboard showed the login form, so the login was not kept"
+        : "Found no loan links on the dashboard; the page layout may have changed (see logs)"
+    );
+  }
 
   const loans = [];
   for (const url of urls) loans.push(...books(await session.get(url)));
