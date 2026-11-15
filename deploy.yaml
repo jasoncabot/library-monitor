@@ -1,0 +1,43 @@
+services:
+  library-monitor:
+    image: ghcr.io/jasoncabot/library-monitor:latest
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+        reservations:
+          cpus: '0.05'
+          memory: 32M
+    environment:
+      # Credentials and addresses stay out of git: supply them from the stack's
+      # own environment.
+      BORROWER_ID: ${BORROWER_ID}
+      BORROWER_PASSWORD: ${BORROWER_PASSWORD}
+      EMAIL_TO: ${EMAIL_TO}
+      MAILGUN_API_KEY: ${MAILGUN_API_KEY}
+      MAILGUN_DOMAIN: ${MAILGUN_DOMAIN}
+      # https://api.eu.mailgun.net for domains in Mailgun's EU region.
+      MAILGUN_BASE_URL: ${MAILGUN_BASE_URL:-https://api.mailgun.net}
+      TZ: Europe/London
+      CHECK_TIME: '06:00'
+    healthcheck:
+      interval: 30s
+      retries: 5
+      start_period: 10s
+      test:
+        - CMD
+        - wget
+        - '-q'
+        - '--spider'
+        - http://0.0.0.0:8080/healthz
+      timeout: 5s
+    ports:
+      - 192.168.100.0:30106:8080
+    read_only: true
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    user: '568:568'
