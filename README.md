@@ -14,7 +14,7 @@ Once a day it logs into the Wokingham Spydus catalogue, reads your current loans
 | --- | --- | --- |
 | `BORROWER_ID` | – | Library card number (required) |
 | `BORROWER_PASSWORD` | – | 4 digit PIN (required) |
-| `EMAIL_TO` | – | Comma separated recipients; failure alerts only go to the first (required) |
+| `EMAIL_TO` | – | Recipients, separated by commas or semicolons; failure alerts only go to the first (required) |
 | `MAILGUN_API_KEY` | – | Mailgun sending API key (required) |
 | `MAILGUN_DOMAIN` | – | Your sending domain in Mailgun (required) |
 | `MAILGUN_BASE_URL` | `https://api.mailgun.net` | Use `https://api.eu.mailgun.net` for an EU-region domain |
@@ -35,8 +35,8 @@ curl -X POST 'localhost:8080/run?alwaysSend=true'   # check now and email whatev
 Or without Docker, for a single check:
 
 ```sh
-set -a; . ./.env; set +a
-node monitor.mjs --once                # add --always-send to email every loan
+node --env-file=.env monitor.mjs --once                # add --always-send to email every loan
+node --env-file=.env monitor.mjs --once --dry-run      # print the email instead of sending it
 ```
 
 ## Endpoints
@@ -57,5 +57,3 @@ node monitor.mjs --once                # add --always-send to email every loan
 To cut a release: `git tag v1.2.3 && git push origin v1.2.3`.
 
 `deploy.yaml` is the TrueNAS stack definition. It pulls `ghcr.io/jasoncabot/library-monitor:latest` and reads the credentials and Mailgun settings from the stack's own environment, so none of them live in git. The container runs with a read-only filesystem as a non-root user, with all capabilities dropped, and keeps no state on disk. It's published on port `30106`.
-
-While the repository is private, its container package is private too. Either make the package public (it contains no credentials) or log the NAS in to `ghcr.io` with a personal access token that has `read:packages`.

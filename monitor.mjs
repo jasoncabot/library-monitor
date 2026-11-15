@@ -13,6 +13,9 @@ const DASHBOARD_PATH = "/cgi-bin/spydus.exe/PGM/WPAC/CCOPT/LB/1?ISGLB=0";
 const USER_AGENT =
   "Mozilla/5.0 (compatible; library-monitor/3.0; +https://github.com/jasoncabot/library-monitor)";
 
+// --dry-run logs emails instead of sending them, so Mailgun isn't needed.
+const dryRun = process.argv.includes("--dry-run");
+
 const env = (name, fallback) => {
   const value = process.env[name] ?? fallback;
   if (value === undefined || value === "") throw new Error(`${name} must be set`);
@@ -22,9 +25,9 @@ const env = (name, fallback) => {
 const config = {
   borrowerId: env("BORROWER_ID"),
   password: env("BORROWER_PASSWORD"),
-  emailTo: env("EMAIL_TO").split(",").map((a) => a.trim()).filter(Boolean),
-  mailgunApiKey: env("MAILGUN_API_KEY"),
-  mailgunDomain: env("MAILGUN_DOMAIN"),
+  emailTo: env("EMAIL_TO").split(/[,;]/).map((a) => a.trim()).filter(Boolean),
+  mailgunApiKey: env("MAILGUN_API_KEY", dryRun ? "-" : undefined),
+  mailgunDomain: env("MAILGUN_DOMAIN", dryRun ? "example.com" : undefined),
   // https://api.eu.mailgun.net for domains in Mailgun's EU region.
   mailgunBaseUrl: env("MAILGUN_BASE_URL", "https://api.mailgun.net"),
   checkTime: env("CHECK_TIME", "06:00"),
@@ -92,11 +95,11 @@ class Session {
       }
       const html = await response.text();
 
-      // After login Spydus answers with a tiny page whose script redirects to
-      // the account dashboard, so follow those like an HTTP redirect.
-      const scripted = html.length < 2000 && html.match(/location(?:\.href)?\s*=\s*["']([^"']+)["']|location\.replace\(\s*["']([^"']+)["']/i);
-      if (scripted) {
-        url = new URL(decode(scripted[1] ?? scripted[2]), url).toString();
+      // After login Spydus answers with a tiny page that redirects to the
+      // account dashboard, so follow those like an HTTP redirect.
+      const [target] = html.length < 2000 ? pageRedirects(html) : [];
+      if (target) {
+        url = new URL(target, url).toString();
         init = {};
         continue;
       }
@@ -149,6 +152,12 @@ const books = (html) => {
   });
 };
 
+// Targets of <meta http-equiv="refresh"> tags and script location changes.
+const pageRedirects = (html) =>
+  [...html.matchAll(/(?:location(?:\.href)?\s*=|location\.replace\(|http-equiv\s*=\s*["']?refresh["']?[^>]*url\s*=)\s*["']?([^"')\s>]+)/gi)].map((m) =>
+    decode(m[1])
+  );
+
 // A structural summary of a page for diagnosing parser failures. Query strings
 // are dropped so session and account identifiers don't end up in logs.
 const describe = (html) => {
@@ -164,7 +173,7 @@ const describe = (html) => {
     bytes: html.length,
     title: decode(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? ""),
     headings: [...html.matchAll(/<h[1-3]\b[^>]*>([\s\S]*?)<\/h[1-3]>/gi)].map((m) => decode(m[1])).slice(0, 10),
-    redirects: [...html.matchAll(/(?:location(?:\.href)?\s*=|location\.replace\(|http-equiv=["']refresh["'][^>]*url=)\s*["']?([^"')\s>]+)/gi)].map((m) => path(m[1])),
+    redirects: pageRedirects(html).map(path),
     links: [...links].slice(0, 40).map(([href, cls]) => (cls ? `${href} .${cls.trim().split(/\s+/).join(".")}` : href)),
   };
 };
@@ -208,6 +217,8 @@ async function fetchLoans() {
 }
 
 async function sendEmail(to, subject, text) {
+  if (dryRun) return log("Dry run, not sending email", { to, subject, text });
+
   const form = new URLSearchParams({ from: config.emailFrom, subject, text });
   for (const address of to) form.append("to", address);
 
