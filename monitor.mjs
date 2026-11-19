@@ -7,7 +7,8 @@
 
 import { createServer } from "node:http";
 
-const BASE_URL = "https://wokingham.spydus.co.uk";
+// SPYDUS_BASE_URL is only for testing against a local mock of the site.
+const BASE_URL = process.env.SPYDUS_BASE_URL || "https://wokingham.spydus.co.uk";
 const LOGIN_PATH = "/cgi-bin/spydus.exe/PGM/WPAC/CCOPT/LB/2";
 const DASHBOARD_PATH = "/cgi-bin/spydus.exe/PGM/WPAC/CCOPT/LB/1?ISGLB=0";
 const USER_AGENT =
@@ -33,14 +34,45 @@ const config = {
   checkTime: env("CHECK_TIME", "06:00"),
   notifyWithinMs: Number(env("NOTIFY_WITHIN_DAYS", "2")) * 24 * 60 * 60 * 1000,
   listenPort: Number(env("LISTEN_PORT", "8080")),
+  // A failed check is retried with a fresh login, waiting RETRY_DELAY_SECONDS
+  // before the second attempt and doubling the wait each time after that.
+  retryAttempts: Math.max(1, Number(env("RETRY_ATTEMPTS", "3"))),
+  retryDelayMs: Number(env("RETRY_DELAY_SECONDS", "30")) * 1000,
 };
+const VERSION = process.env.APP_VERSION || "dev";
+const REPO_URL = "https://github.com/jasoncabot/library-monitor";
+const REQUEST_TIMEOUT_MS = 30_000;
 config.emailFrom = env("EMAIL_FROM", `Library Monitor <library-monitor@${config.mailgunDomain}>`);
 
-const log = (message, fields = {}) =>
-  console.log(JSON.stringify({ time: new Date().toISOString(), message, ...fields }));
+// Lines logged during the current run, kept for the failure report.
+let runLog = null;
 
+const log = (message, fields = {}) => {
+  const line = redact(JSON.stringify({ time: new Date().toISOString(), message, ...fields }));
+  runLog?.push(line);
+  console.log(line);
+};
+
+// Keeps the card number and PIN out of logs and failure reports.
+function redact(text) {
+  let out = String(text);
+  const { borrowerId, password } = config;
+  if (borrowerId.length >= 4) out = out.replaceAll(borrowerId, "[BORROWER_ID]");
+  out = out.replace(/(BRWLPWD["']?\s*[=:]\s*["']?)[^&"'\s>]*/gi, "$1[REDACTED]");
+  // A 4 digit PIN would also match dates and IDs, so only exact attribute values are replaced.
+  out = out.replaceAll(`value="${password}"`, 'value="[REDACTED]"');
+  if (password.length >= 6) out = out.replaceAll(password, "[REDACTED]");
+  return out;
+}
+
+// retryable is false for failures another attempt can't fix, such as a
+// rejected PIN, where retrying could also lock the account.
 class SpydusError extends Error {
   name = "SpydusError";
+  constructor(message, { retryable = true, ...options } = {}) {
+    super(message, options);
+    this.retryable = retryable;
+  }
 }
 
 // --- Fetching -------------------------------------------------------------
@@ -49,8 +81,12 @@ class SpydusError extends Error {
 // cookies, so every response's cookies are kept and replayed.
 class Session {
   cookies = new Map();
+  // Every request made, and the last HTML page received, for the failure report.
+  trace = [];
+  lastPage = null;
 
   store(response) {
+    const names = [];
     for (const header of response.headers.getSetCookie()) {
       const [pair, ...attributes] = header.split(";");
       const index = pair.indexOf("=");
@@ -60,12 +96,19 @@ class Session {
       const expired = attributes.some((a) => /^\s*expires=.*1970/i.test(a));
       if (!value || expired) this.cookies.delete(name);
       else this.cookies.set(name, value);
+      names.push(expired || !value ? `-${name}` : name);
     }
+    return names;
+  }
+
+  record(entry) {
+    this.trace.push(entry);
+    log("HTTP", entry);
   }
 
   async get(url, init = {}) {
     // Follow redirects by hand so cookies set along the way are kept.
-    for (let hop = 0; hop < 5; hop++) {
+    for (let hop = 0; hop < 8; hop++) {
       const headers = new Headers(init.headers);
       headers.set("user-agent", USER_AGENT);
       headers.set("accept", "text/html,application/xhtml+xml");
@@ -73,31 +116,46 @@ class Session {
         headers.set("cookie", [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; "));
       }
 
-      const response = await fetch(url, { ...init, headers, redirect: "manual" });
-      this.store(response);
-
-      const location = response.headers.get("location");
-      if (response.status >= 300 && response.status < 400 && location) {
-        await response.body?.cancel();
-        url = new URL(location, url).toString();
-        init = {};
-        continue;
+      const method = init.method ?? "GET";
+      const started = Date.now();
+      const entry = { method, url, cookiesSent: [...this.cookies.keys()] };
+      let response;
+      let html;
+      try {
+        response = await fetch(url, { ...init, headers, redirect: "manual", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+        entry.status = response.status;
+        entry.cookiesSet = this.store(response);
+        const location = response.headers.get("location");
+        if (response.status >= 300 && response.status < 400 && location) {
+          await response.body?.cancel();
+          this.record({ ...entry, ms: Date.now() - started, location });
+          url = new URL(location, url).toString();
+          init = {};
+          continue;
+        }
+        html = await response.text();
+      } catch (error) {
+        const reason = error.name === "TimeoutError" ? `timed out after ${REQUEST_TIMEOUT_MS / 1000}s` : (error.cause?.message ?? error.message);
+        this.record({ ...entry, ms: Date.now() - started, error: reason });
+        throw new SpydusError(`${method} ${url} failed: ${reason}`, { cause: error });
       }
 
       const wafAction = response.headers.get("x-amzn-waf-action");
-      if (wafAction) {
-        await response.body?.cancel();
-        throw new SpydusError(`${url} was blocked by AWS WAF (${wafAction}, status ${response.status})`);
-      }
-      if (!response.ok) {
-        await response.body?.cancel();
-        throw new SpydusError(`${url} returned ${response.status}`);
-      }
-      const html = await response.text();
-
       // After login Spydus answers with a tiny page that redirects to the
       // account dashboard, so follow those like an HTTP redirect.
-      const [target] = html.length < 2000 ? pageRedirects(html) : [];
+      const [target] = response.ok && html.length < 2000 ? pageRedirects(html) : [];
+      this.lastPage = { url, status: response.status, contentType: response.headers.get("content-type"), html };
+      this.record({
+        ...entry,
+        ms: Date.now() - started,
+        bytes: html.length,
+        title: decode(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] ?? "") || undefined,
+        wafAction: wafAction ?? undefined,
+        pageRedirect: target,
+      });
+
+      if (wafAction) throw new SpydusError(`${url} was blocked by AWS WAF (${wafAction}, status ${response.status})`);
+      if (!response.ok) throw new SpydusError(`${method} ${url} returned ${response.status}`);
       if (target) {
         url = new URL(target, url).toString();
         init = {};
@@ -180,9 +238,9 @@ const describe = (html) => {
 
 // --- Checking -------------------------------------------------------------
 
-async function fetchLoans() {
-  const session = new Session();
+const showsLoginForm = (html) => /id\s*=\s*["']frmLogin["']/.test(html);
 
+async function fetchLoans(session) {
   log("Logging in", { borrowerId: config.borrowerId.slice(-4).padStart(config.borrowerId.length, "*") });
   const loginHtml = await session.get(BASE_URL + LOGIN_PATH, {
     method: "POST",
@@ -193,27 +251,156 @@ async function fetchLoans() {
     throw new SpydusError("Login was blocked by an AWS WAF challenge");
   }
   if (/Invalid ID or password/i.test(loginHtml)) {
-    throw new SpydusError("Login rejected: Invalid ID or password. Check BORROWER_ID and BORROWER_PASSWORD (a 4 digit PIN).");
+    throw new SpydusError("Login rejected: Invalid ID or password. Check BORROWER_ID and BORROWER_PASSWORD (a 4 digit PIN).", {
+      retryable: false,
+    });
   }
 
-  // A successful login lands on the account dashboard.
-  const dashboard = loginHtml;
-  const urls = loanUrls(dashboard);
+  // A successful login normally lands on the account dashboard. If it lands
+  // somewhere else, load the dashboard directly before giving up.
+  let dashboard = loginHtml;
+  let urls = loanUrls(dashboard);
+  if (urls.length === 0 && !showsLoginForm(dashboard)) {
+    log("No loan links on the page after login, loading the dashboard", describe(dashboard));
+    dashboard = await session.get(BASE_URL + DASHBOARD_PATH);
+    urls = loanUrls(dashboard);
+  }
   log("Found loan pages", { count: urls.length });
   if (urls.length === 0) {
     // Every account dashboard links to its loans, so none means the page has
     // changed. Describe it so the parser can be fixed from the logs.
     log("Dashboard", { cookies: [...session.cookies.keys()], ...describe(dashboard) });
     throw new SpydusError(
-      /id\s*=\s*["']frmLogin["']/.test(dashboard)
+      showsLoginForm(dashboard)
         ? "Dashboard showed the login form, so the login was not kept"
         : "Found no loan links on the dashboard; the page layout may have changed (see logs)"
     );
   }
 
   const loans = [];
-  for (const url of urls) loans.push(...books(await session.get(url)));
+  for (const url of urls) {
+    const page = await session.get(url);
+    const found = books(page);
+    log("Read loan page", { url, books: found.length });
+    if (found.length === 0) log("Loan page had no books", describe(page));
+    loans.push(...found);
+  }
   return loans;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Each attempt logs in again with a fresh session. The error from the last
+// attempt carries its session and attempt count for the failure report.
+async function fetchLoansWithRetries() {
+  for (let attempt = 1; ; attempt++) {
+    const session = new Session();
+    try {
+      log("Attempt", { attempt, of: config.retryAttempts });
+      return await fetchLoans(session);
+    } catch (error) {
+      error.session = session;
+      error.attempts = attempt;
+      const willRetry = error.retryable !== false && attempt < config.retryAttempts;
+      const delayMs = config.retryDelayMs * 2 ** (attempt - 1);
+      log("Attempt failed", { attempt, error: error.message, retrying: willRetry ? `in ${delayMs / 1000}s` : false });
+      if (!willRetry) throw error;
+      await sleep(delayMs);
+    }
+  }
+}
+
+// --- Failure reports ------------------------------------------------------
+
+// The page with scripts, styles and head boilerplate cut down, so the part
+// that matters to the parser fits in an email.
+function pageExcerpt(html, limit) {
+  const cleaned = html
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<head\b[^>]*>[\s\S]*?<\/head>/i, (head) => {
+      const keep = [...head.matchAll(/<title[^>]*>[\s\S]*?<\/title>|<meta\b[^>]*refresh[^>]*>/gi)].map((m) => m[0]);
+      return `<head>${keep.join("")}</head>`;
+    })
+    .replace(/<(script|style|svg|noscript)\b([^>]*)>([\s\S]*?)<\/\1>/gi, (whole, tag, attrs, body) =>
+      tag.toLowerCase() === "script" && body.length <= 400 ? whole : `<${tag}${attrs}>[${body.length} chars removed]</${tag}>`
+    )
+    .replace(/(["'])data:[^"']{60,}\1/gi, '"data:..."')
+    .replace(/>\s+</g, ">\n<")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n")
+    .trim();
+  return cleaned.length > limit
+    ? `${cleaned.slice(0, limit)}\n... [truncated, ${cleaned.length - limit} more characters]`
+    : cleaned;
+}
+
+// A plain-text report with everything needed to understand a failure: paste
+// it into Claude along with monitor.mjs.
+function failureReport({ error, startedAt, pageLimit }) {
+  const session = error.session;
+  const causes = [];
+  for (let e = error.cause; e && causes.length < 5; e = e.cause) causes.push(`${e.name ?? "Error"}: ${e.message}${e.code ? ` (${e.code})` : ""}`);
+
+  const requests = (session?.trace ?? []).map((r, i) => {
+    const target = r.location ? ` -> ${r.location}` : r.pageRedirect ? ` -> (page redirect) ${r.pageRedirect}` : "";
+    const outcome = r.error ? `FAILED: ${r.error}` : `${r.status}${r.bytes !== undefined ? `, ${r.bytes} bytes` : ""}`;
+    const extras = [
+      r.title && `title "${r.title}"`,
+      r.wafAction && `WAF ${r.wafAction}`,
+      `cookies sent [${r.cookiesSent.join(", ")}]`,
+      r.cookiesSet?.length && `set [${r.cookiesSet.join(", ")}]`,
+    ].filter(Boolean);
+    return `${i + 1}. ${r.method} ${r.url}\n   ${outcome} in ${r.ms} ms${target}\n   ${extras.join("; ")}`;
+  });
+
+  const page = session?.lastPage;
+  const sections = [
+    "# Library Monitor failure report",
+    "",
+    `This is a failure report from Library Monitor (${REPO_URL}), which logs into the Wokingham Spydus library catalogue with a plain fetch-based scraper (monitor.mjs) and emails when loans are due. Please explain what went wrong and, if the scraper needs changing, suggest a fix to monitor.mjs. The card number and PIN have been replaced with [BORROWER_ID] and [REDACTED].`,
+    "",
+    "## Summary",
+    `- Error: ${error.message}`,
+    `- Error type: ${error.name}${error.retryable === false ? " (not retried)" : ""}`,
+    `- Attempts: ${error.attempts ?? 1} of ${config.retryAttempts} (fresh login each time, first retry after ${config.retryDelayMs / 1000}s, doubling)`,
+    `- Run started: ${startedAt}`,
+    `- Report created: ${new Date().toISOString()}`,
+    `- Version: ${VERSION}`,
+    `- Runtime: Node ${process.version} on ${process.platform}/${process.arch}, TZ=${process.env.TZ ?? Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+    "",
+    "## Error",
+    "```",
+    error.stack ?? String(error),
+    ...causes.map((c) => `Caused by ${c}`),
+    "```",
+    "",
+    "## HTTP requests in the last attempt",
+    requests.length ? requests.join("\n") : "(none were made)",
+    "",
+    "## Log for this run",
+    "```",
+    ...(runLog ?? []),
+    "```",
+  ];
+  if (page) {
+    sections.push(
+      "",
+      "## Last page received",
+      `- URL: ${page.url}`,
+      `- Status: ${page.status}, content type ${page.contentType ?? "unknown"}, ${page.html.length} bytes`,
+      "",
+      "Structure:",
+      "```json",
+      JSON.stringify(describe(page.html), null, 2),
+      "```",
+      "",
+      "HTML (scripts, styles and head trimmed):",
+      "```html",
+      pageExcerpt(page.html, pageLimit),
+      "```"
+    );
+  }
+  return redact(sections.join("\n"));
 }
 
 // --- Emails ---------------------------------------------------------------
@@ -331,31 +518,54 @@ ${book.status ? `<div style="margin-top:6px;font-size:13px;color:#7b8794;">${esc
   return { subject, text, html };
 }
 
-function failureEmail(message) {
+function failureEmail(message, { inlineReport, fullReport }) {
   const intro = "Today's library check failed, so books coming up to their due date may not have been reported.";
+  const mono = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
+  // <details> collapses the report in Apple Mail, iOS Mail and Thunderbird;
+  // clients that don't support it (Gmail) show it expanded.
   const html = layout({
     preheader: message,
     heading: "Library check failed",
     intro: escapeHtml(intro),
-    content: `<div style="padding:14px 16px;border-radius:8px;background:#fef3f2;border:1px solid #fecdca;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;line-height:1.5;color:#b42318;word-break:break-word;">${escapeHtml(message)}</div>
-<p style="margin:12px 0 0;font-size:14px;line-height:1.5;color:#52606d;">Check your loans on the library website until this is fixed.</p>`,
+    content: `<div style="padding:14px 16px;border-radius:8px;background:#fef3f2;border:1px solid #fecdca;font-family:${mono};font-size:13px;line-height:1.5;color:#b42318;word-break:break-word;">${escapeHtml(message)}</div>
+<p style="margin:12px 0 0;font-size:14px;line-height:1.5;color:#52606d;">Check your loans on the library website until this is fixed.</p>
+<details style="margin:16px 0 0;border:1px solid #e4e7eb;border-radius:8px;">
+<summary style="padding:12px 16px;cursor:pointer;font-size:14px;font-weight:600;color:#1f2933;">Diagnostic report</summary>
+<div style="padding:0 16px 16px;">
+<p style="margin:0 0 10px;font-size:13px;line-height:1.5;color:#52606d;">Copy this into Claude to find out what went wrong. The attached <b>library-monitor-report.txt</b> has the same report with more of the page.</p>
+<pre style="margin:0;padding:12px;background:#f5f7fa;border-radius:6px;font-family:${mono};font-size:11px;line-height:1.45;color:#323f4b;white-space:pre-wrap;word-break:break-word;">${escapeHtml(inlineReport)}</pre>
+</div>
+</details>`,
     button: { label: "Log in to the library", href: LOGIN_URL },
   });
-  return { subject: "Library Monitor failed", text: `${intro}\n\n${message}\n\nLog in: ${LOGIN_URL}`, html };
+  return {
+    subject: "Library Monitor failed",
+    text: `${intro}\n\n${message}\n\nLog in: ${LOGIN_URL}\n\n----- Diagnostic report (copy into Claude) -----\n\n${inlineReport}`,
+    html,
+    attachments: [{ filename: "library-monitor-report.txt", type: "text/plain", content: fullReport }],
+  };
 }
 
-async function sendEmail(to, { subject, text, html }) {
+async function sendEmail(to, { subject, text, html, attachments = [] }) {
   if (dryRun) {
     const { writeFileSync } = await import("node:fs");
     const { join } = await import("node:path");
     const { tmpdir } = await import("node:os");
     const preview = join(tmpdir(), "library-monitor-email.html");
     writeFileSync(preview, html);
-    return log("Dry run, not sending email", { to, subject, text, preview });
+    const files = attachments.map((a) => {
+      const path = join(tmpdir(), a.filename);
+      writeFileSync(path, a.content);
+      return path;
+    });
+    // Printed rather than logged so the run log doesn't contain itself.
+    return console.log(JSON.stringify({ message: "Dry run, not sending email", to, subject, preview, attachments: files }));
   }
 
-  const form = new URLSearchParams({ from: config.emailFrom, subject, text, html });
+  const form = new FormData();
+  for (const [key, value] of Object.entries({ from: config.emailFrom, subject, text, html })) form.append(key, value);
   for (const address of to) form.append("to", address);
+  for (const a of attachments) form.append("attachment", new Blob([a.content], { type: a.type }), a.filename);
 
   const response = await fetch(`${config.mailgunBaseUrl}/v3/${config.mailgunDomain}/messages`, {
     method: "POST",
@@ -375,7 +585,7 @@ async function sendEmail(to, { subject, text, html }) {
 }
 
 async function check(alwaysSend) {
-  const loans = await fetchLoans();
+  const loans = await fetchLoansWithRetries();
   const now = Date.now();
   const notify = loans.filter((book) => {
     log("Book on loan", book);
@@ -390,23 +600,30 @@ async function check(alwaysSend) {
 }
 
 let lastRun = null;
+let lastReport = null;
 let running = null;
 
 // Runs the check and, if it fails, emails the first recipient so a broken
 // scraper doesn't look the same as "nothing due".
 async function run(alwaysSend = false) {
   const startedAt = new Date().toISOString();
+  runLog = [];
   try {
     const result = await check(alwaysSend);
     lastRun = { startedAt, ok: true, ...result };
   } catch (error) {
     log("Library check failed", { error: error.message });
-    lastRun = { startedAt, ok: false, error: error.message };
+    lastRun = { startedAt, ok: false, error: error.message, attempts: error.attempts, report: "/report" };
     try {
-      await sendEmail(config.emailTo.slice(0, 1), failureEmail(error.message));
+      // The email keeps a shorter page excerpt so Gmail doesn't clip it.
+      lastReport = failureReport({ error, startedAt, pageLimit: 60_000 });
+      const inlineReport = failureReport({ error, startedAt, pageLimit: 12_000 });
+      await sendEmail(config.emailTo.slice(0, 1), failureEmail(redact(error.message), { inlineReport, fullReport: lastReport }));
     } catch (alertError) {
       log("Failed to send failure alert", { error: alertError.message });
     }
+  } finally {
+    runLog = null;
   }
   return lastRun;
 }
@@ -449,6 +666,10 @@ createServer(async (req, res) => {
 
   if (url.pathname === "/healthz") return json(200, { ok: true });
   if (url.pathname === "/" && req.method === "GET") return json(200, { nextCheck: nextCheck().toString(), lastRun });
+  if (url.pathname === "/report" && req.method === "GET") {
+    res.writeHead(lastReport ? 200 : 404, { "content-type": "text/plain; charset=utf-8" });
+    return res.end(lastReport ?? "No failure since the container started.\n");
+  }
   // POST so a crawler or link preview can't trigger emails.
   if (url.pathname === "/run" && req.method === "POST") {
     return json(200, await runOnce(url.searchParams.get("alwaysSend") === "true"));

@@ -4,6 +4,10 @@ Wokingham library doesn't let you know when your books are near their renewal da
 
 Once a day it logs into the Wokingham Spydus catalogue, reads your current loans, and emails you if any are due within two days. If the check itself fails (the login is rejected, the site changes, it gets blocked), it emails the first recipient instead, so a broken check doesn't look the same as "nothing due".
 
+A failed check is retried a couple of times with a fresh login first, since the site sometimes drops a login or a request. A rejected card number or PIN isn't retried, so a wrong PIN can't lock the account.
+
+The failure email has a collapsible **Diagnostic report** (shown expanded in Gmail, which doesn't support collapsing) and the same report attached as `library-monitor-report.txt`. It has the error and stack, every HTTP request in the last attempt (status, redirects, cookie names, timings), the run's log, and a trimmed copy of the last page received. Paste it into Claude to find out what went wrong and how to fix the scraper. The card number and PIN are replaced with placeholders, but the page may include your name and loans.
+
 - One JavaScript file, no dependencies, runs on Node 24.
 - Email goes out through the [Mailgun](https://documentation.mailgun.com/docs/mailgun/api-reference/send/mailgun/messages) API.
 - It has to run from a home connection. The library site is behind AWS WAF, which shows a CAPTCHA to datacenter IPs. That's why this stopped working as a Cloudflare Worker.
@@ -22,6 +26,8 @@ Once a day it logs into the Wokingham Spydus catalogue, reads your current loans
 | `CHECK_TIME` | `06:00` | Daily check time, in `TZ` |
 | `TZ` | `Europe/London` | Timezone for `CHECK_TIME` |
 | `NOTIFY_WITHIN_DAYS` | `2` | Email when a book is due within this many days |
+| `RETRY_ATTEMPTS` | `3` | Attempts before reporting a failure, each with a fresh login |
+| `RETRY_DELAY_SECONDS` | `30` | Wait before the first retry; doubles after each attempt |
 | `LISTEN_PORT` | `8080` | Port for the HTTP endpoints |
 
 ## Running
@@ -43,6 +49,7 @@ node --env-file=.env monitor.mjs --once --dry-run      # print the email instead
 
 - `GET /healthz`: liveness probe used by the compose healthcheck
 - `GET /`: the next scheduled check and the last result as JSON
+- `GET /report`: the diagnostic report from the most recent failure, as plain text
 - `POST /run`: check now; `?alwaysSend=true` emails every loan, not just those due soon
 
 ## Deploying to the NAS
