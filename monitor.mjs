@@ -10,7 +10,9 @@ import { createServer } from "node:http";
 // SPYDUS_BASE_URL is only for testing against a local mock of the site.
 const BASE_URL = process.env.SPYDUS_BASE_URL || "https://wokingham.spydus.co.uk";
 const LOGIN_PATH = "/cgi-bin/spydus.exe/PGM/WPAC/CCOPT/LB/2";
-const DASHBOARD_PATH = "/cgi-bin/spydus.exe/PGM/WPAC/CCOPT/LB/1?ISGLB=0";
+// The WPAC dashboard now redirects to the catalogue home page, so use the
+// OPAC one that the account menu links to as "Dashboard".
+const DASHBOARD_PATH = "/cgi-bin/spydus.exe/PGM/OPAC/CCOPT/LB/1?ISGLB=0";
 const USER_AGENT =
   "Mozilla/5.0 (compatible; library-monitor/3.0; +https://github.com/jasoncabot/library-monitor)";
 
@@ -186,13 +188,18 @@ const decode = (html) =>
 const attribute = (tag, name) =>
   tag.match(new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"))?.slice(1).find((v) => v !== undefined);
 
-const loanUrls = (html) =>
-  [...html.matchAll(/<a\b[^>]*>/gi)]
-    .map(([tag]) => tag)
-    .filter((tag) => /\bbrw-dashboard-item\b/.test(attribute(tag, "class") ?? ""))
-    .map((tag) => attribute(tag, "href"))
-    .filter(Boolean)
-    .map((href) => new URL(decode(href), BASE_URL).toString());
+// Loan pages are linked from the dashboard tiles (a.brw-dashboard-item) and,
+// on every signed-in page, from the account menu's "Current loans" item, an
+// ENQ/<interface>/LOANRENQ link. Use the tiles if present, else the menu link.
+const loanUrls = (html) => {
+  const tags = [...html.matchAll(/<a\b[^>]*>/gi)].map(([tag]) => tag);
+  const hrefs = (keep) =>
+    [...new Set(tags.filter(keep).map((tag) => attribute(tag, "href")).filter(Boolean))].map((href) =>
+      new URL(decode(href), BASE_URL).toString()
+    );
+  const tiles = hrefs((tag) => /\bbrw-dashboard-item\b/.test(attribute(tag, "class") ?? ""));
+  return tiles.length ? tiles : hrefs((tag) => /\/ENQ\/\w+\/LOANRENQ\//i.test(attribute(tag, "href") ?? ""));
+};
 
 // Each loan on the page starts with a hidden <input name="SVL"> and is followed
 // by its title (h2.card-title) and a table with Due and Status cells.
